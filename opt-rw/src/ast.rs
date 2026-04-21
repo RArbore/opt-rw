@@ -1,5 +1,7 @@
 use core::fmt::{Display, Formatter, Result};
 
+use derive_more::FromStr;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncAST {
     pub name: String,
@@ -24,13 +26,13 @@ pub enum ExprAST {
     Binary(BinaryOp, Box<ExprAST>, Box<ExprAST>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, FromStr)]
 pub enum UnaryOp {
     Neg,
     Not,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, FromStr)]
 pub enum BinaryOp {
     Add,
     Sub,

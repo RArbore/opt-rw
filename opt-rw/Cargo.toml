@@ -8,7 +8,9 @@ name = "opt_rw"
 path = "src/lib.rs"
 
 [dependencies]
+derive_more = { version = "*", features = ["from_str"] }
 egg = "*"
+rustc-hash = "*"
 lalrpop-util = { version = "*", features = ["lexer", "unicode"] }
 
 [build-dependencies]
