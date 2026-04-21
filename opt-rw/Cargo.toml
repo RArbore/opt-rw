@@ -1,0 +1,15 @@
+[package]
+name = "opt-rw"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "opt_rw"
+path = "src/lib.rs"
+
+[dependencies]
+egg = "*"
+lalrpop-util = { version = "*", features = ["lexer", "unicode"] }
+
+[build-dependencies]
+lalrpop = "*"
