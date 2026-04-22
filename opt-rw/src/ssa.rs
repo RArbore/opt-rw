@@ -109,6 +109,10 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         self.cfg.borrow_mut()[id] = block;
     }
 
+    fn remove_blocks(&self, first_to_remove: BlockId) {
+        self.cfg.borrow_mut().truncate(first_to_remove);
+    }
+
     fn handle_stmt(self, stmt: &'a StmtAST) -> Option<Self> {
         use StmtAST::*;
         match stmt {
@@ -179,7 +183,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     }
 
     fn handle_while(mut self, cond: &ExprAST, stmt: &'a StmtAST) -> Option<Self> {
-        let true_cond = self.handle_expr(cond);
+        let mut true_cond = self.handle_expr(cond);
         if self.is_always_false(true_cond) {
             return Some(self);
         }
@@ -189,6 +193,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         ctx.last_block = body_block;
 
         if let Some(ctx) = ctx.handle_stmt(stmt) {
+            self.remove_blocks(body_block);
             let header_block =
                 self.add_block(Block::Child(self.last_block, self.mk(SSA::Constant(1))));
             let mut new_ctx = self.clone();
@@ -197,7 +202,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
                     .vars
                     .insert(name, self.mk(SSA::Knot(header_block, name)));
             });
-            let true_cond = new_ctx.handle_expr(cond);
+            true_cond = new_ctx.handle_expr(cond);
             let new_body_block = self.add_block(Block::Child(header_block, true_cond));
             new_ctx.last_block = new_body_block;
             let new_ctx = new_ctx.handle_stmt(stmt).unwrap();
@@ -212,7 +217,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
                     let knot = self.lookup(SSA::Knot(header_block, name)).unwrap();
                     let phi = self.mk(SSA::Phi(header_block, [init_value, loop_value]));
                     self.union(knot, phi);
-                    exit_ctx.vars.insert(name, phi);
+                    exit_ctx.vars.insert(name, self.find(knot));
                 },
             );
             exit_ctx.last_block = header_block;
@@ -256,6 +261,10 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         self.dfg.borrow_mut().union(a, b);
     }
 
+    fn find(&self, id: Id) -> Id {
+        self.dfg.borrow().find(id)
+    }
+
     fn is_always_false(&self, value: Id) -> bool {
         self.mk(SSA::Constant(0)) == value
     }
@@ -274,4 +283,99 @@ fn ssa_intersection<'a, 'b>(
             None
         }
     })
+}
+
+mod tests {
+    #[allow(unused_imports)]
+    use crate::grammar::ProgramParser;
+
+    #[allow(unused_imports)]
+    use super::*;
+    
+    #[test]
+    fn ssa1() {
+        let program = r#"
+fn test(x) return x;
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+
+        use SSA::*;
+        let id = dfg.lookup(Param(0)).unwrap();
+
+        use Block::*;
+        assert_eq!(cfg, [Start, Return(0, id)]);
+    }
+    
+    #[test]
+    fn ssa2() {
+        let program = r#"
+fn test(x) { if x {  } else {  } return x; }
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+
+        use SSA::*;
+        use UnaryOp::*;
+        let x = dfg.lookup(Param(0)).unwrap();
+        let not_x = dfg.lookup(Unary(Not, x)).unwrap();
+
+        use Block::*;
+        assert_eq!(cfg, [Start, Child(0, x), Child(0, not_x), Merge(1, 2), Return(3, x)]);
+    }
+    
+    #[test]
+    fn ssa3() {
+        let program = r#"
+fn test(x) { if 0 { } else { return x; } }
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+
+        use SSA::*;
+        use UnaryOp::*;
+        let x = dfg.lookup(Param(0)).unwrap();
+        let zero = dfg.lookup(Constant(0)).unwrap();
+        let not_zero = dfg.lookup(Unary(Not, zero)).unwrap();
+
+        use Block::*;
+        assert_eq!(cfg, [Start, Child(0, not_zero), Return(1, x)]);
+    }
+    
+    #[test]
+    fn ssa4() {
+        let program = r#"
+fn test(x) { while x { x = x + 1; } return x; }
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+
+        use SSA::*;
+        use UnaryOp::*;
+        let phi = dfg.lookup(Knot(1, "x")).unwrap();
+        let not = dfg.lookup(Unary(Not, phi)).unwrap();
+
+        use Block::*;
+        assert_eq!(cfg, [Start, Merge(0, 2), Child(1, phi), Child(1, not), Return(3, phi)]);
+    }
+    
+    #[test]
+    fn ssa5() {
+        let program = r#"
+fn test(x) { while x { return x + 1; } return x + 1; }
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+
+        use SSA::*;
+        use BinaryOp::*;
+        use UnaryOp::*;
+        let x = dfg.lookup(Param(0)).unwrap();
+        let not_x = dfg.lookup(Unary(Not, x)).unwrap();
+        let one = dfg.lookup(Constant(1)).unwrap();
+        let add = dfg.lookup(Binary(Add, [x, one])).unwrap();
+
+        use Block::*;
+        assert_eq!(cfg, [Start, Child(0, x), Return(1, add), Child(0, not_x), Return(3, add)]);
+    }
 }
