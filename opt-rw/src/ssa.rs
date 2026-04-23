@@ -1,61 +1,38 @@
 use core::cell::RefCell;
-use core::mem::{Discriminant, discriminant};
-use core::slice::{from_mut, from_ref};
+use core::mem::take;
 
-use egg::{EGraph, Id, Language};
+use egg::{EGraph, Id, Rewrite, Runner, SimpleScheduler, define_language, rewrite};
 use rustc_hash::FxHashMap;
 
 use crate::ast::{BinaryOp, ExprAST, FuncAST, StmtAST, UnaryOp};
 
 pub type BlockId = usize;
+type KnotId = usize;
 
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
-pub enum SSA<'a> {
-    Constant(i64),
-    Param(usize),
-    Phi(BlockId, [Id; 2]),
-    Unary(UnaryOp, Id),
-    Binary(BinaryOp, [Id; 2]),
-    Knot(BlockId, &'a str),
+define_language! {
+    pub enum SSA {
+        Constant(i64),
+        Param(usize),
+        Phi(BlockId, [Id; 2]),
+        Unary(UnaryOp, Id),
+        Binary(BinaryOp, [Id; 2]),
+        Knot(KnotId),
+    }
 }
 
-impl<'a> Language for SSA<'a> {
-    type Discriminant = Discriminant<SSA<'a>>;
-
-    fn discriminant(&self) -> Self::Discriminant {
-        discriminant(self)
-    }
-
-    fn matches(&self, other: &Self) -> bool {
-        use SSA::*;
-        match (self, other) {
-            (Constant(a), Constant(b)) if a == b => true,
-            (Param(a), Param(b)) if a == b => true,
-            (Phi(a, _), Phi(b, _)) if a == b => true,
-            (Unary(a, _), Unary(b, _)) if a == b => true,
-            (Binary(a, _), Binary(b, _)) if a == b => true,
-            (Knot(a1, a2), Knot(b1, b2)) if a1 == b1 && a2 == b2 => true,
-            _ => false,
-        }
-    }
-
-    fn children(&self) -> &[Id] {
-        use SSA::*;
-        match self {
-            Constant(_) | Param(_) | Knot(_, _) => &[],
-            Phi(_, ids) | Binary(_, ids) => ids,
-            Unary(_, id) => from_ref(id),
-        }
-    }
-
-    fn children_mut(&mut self) -> &mut [Id] {
-        use SSA::*;
-        match self {
-            Constant(_) | Param(_) | Knot(_, _) => &mut [],
-            Phi(_, ids) | Binary(_, ids) => ids,
-            Unary(_, id) => from_mut(id),
-        }
-    }
+fn mk_rewrites() -> Vec<Rewrite<SSA, ()>> {
+    vec![
+        rewrite!("comm-add"; "(Add ?a ?b)" => "(Add ?b ?a)"),
+        rewrite!("comm-mul"; "(Mul ?a ?b)" => "(Mul ?b ?a)"),
+        rewrite!("mul-1"; "(Mul ?a 1)" => "?a"),
+        rewrite!("add-0"; "(Add ?a 0)" => "?a"),
+        rewrite!("mul-0"; "(Mul ?a 0)" => "0"),
+        rewrite!("mul-2"; "(Mul ?a 2)" => "(Add ?a ?a)"),
+        rewrite!("not-ee"; "(Not (EE ?a ?b))" => "(NE ?a ?b)"),
+        rewrite!("not-ne"; "(Not (NE ?a ?b))" => "(EE ?a ?b)"),
+        rewrite!("ee-same"; "(EE ?a ?a)" => "1"),
+        rewrite!("ne-same"; "(NE ?a ?a)" => "0"),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,26 +43,33 @@ pub enum Block {
     Return(BlockId, Id),
 }
 
-pub type DFG<'a> = EGraph<SSA<'a>, ()>;
+pub type DFG = EGraph<SSA, ()>;
 pub type CFG = Vec<Block>;
+type KnotMap<'a> = FxHashMap<(BlockId, &'a str), KnotId>;
 
 #[derive(Debug, Clone)]
 struct SSACtx<'a, 'b> {
     vars: FxHashMap<&'a str, Id>,
-    dfg: &'b RefCell<DFG<'a>>,
+    dfg: &'b RefCell<DFG>,
     cfg: &'b RefCell<CFG>,
     last_block: BlockId,
+    knots: &'b RefCell<KnotMap<'a>>,
+    rws: &'b Vec<Rewrite<SSA, ()>>,
 }
 
-pub fn optimistic_rewriting(func: &FuncAST) -> (DFG<'_>, CFG) {
+pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
     let dfg = RefCell::new(EGraph::new(()));
     let cfg = RefCell::new(CFG::default());
+    let knots = RefCell::new(KnotMap::default());
 
+    let rws = mk_rewrites();
     let mut ctx = SSACtx {
         vars: FxHashMap::default(),
         dfg: &dfg,
         cfg: &cfg,
         last_block: 0,
+        knots: &knots,
+        rws: &rws,
     };
     for (idx, name) in func.params.iter().enumerate() {
         ctx.vars.insert(name, dfg.borrow_mut().add(SSA::Param(idx)));
@@ -111,6 +95,16 @@ impl<'a, 'b> SSACtx<'a, 'b> {
 
     fn remove_blocks(&self, first_to_remove: BlockId) {
         self.cfg.borrow_mut().truncate(first_to_remove);
+    }
+
+    fn knot(&self, block: BlockId, var: &'a str) -> KnotId {
+        if let Some(id) = self.knots.borrow().get(&(block, var)) {
+            *id
+        } else {
+            let id = self.knots.borrow().len();
+            self.knots.borrow_mut().insert((block, var), id);
+            id
+        }
     }
 
     fn handle_stmt(self, stmt: &'a StmtAST) -> Option<Self> {
@@ -200,7 +194,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
             ssa_intersection(&self.vars, &ctx.vars).for_each(|(name, _, _)| {
                 new_ctx
                     .vars
-                    .insert(name, self.mk(SSA::Knot(header_block, name)));
+                    .insert(name, self.mk(SSA::Knot(self.knot(header_block, name))));
             });
             true_cond = new_ctx.handle_expr(cond);
             let new_body_block = self.add_block(Block::Child(header_block, true_cond));
@@ -214,7 +208,9 @@ impl<'a, 'b> SSACtx<'a, 'b> {
             let mut exit_ctx = self.clone();
             ssa_intersection(&self.vars, &new_ctx.vars).for_each(
                 |(name, init_value, loop_value)| {
-                    let knot = self.lookup(SSA::Knot(header_block, name)).unwrap();
+                    let knot = self
+                        .lookup(SSA::Knot(self.knot(header_block, name)))
+                        .unwrap();
                     let phi = self.mk(SSA::Phi(header_block, [init_value, loop_value]));
                     self.union(knot, phi);
                     exit_ctx.vars.insert(name, self.find(knot));
@@ -249,11 +245,11 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         self.mk(value)
     }
 
-    fn mk(&self, value: SSA<'a>) -> Id {
+    fn mk(&self, value: SSA) -> Id {
         self.dfg.borrow_mut().add(value)
     }
 
-    fn lookup(&self, value: SSA<'a>) -> Option<Id> {
+    fn lookup(&self, value: SSA) -> Option<Id> {
         self.dfg.borrow_mut().lookup(value)
     }
 
@@ -266,7 +262,19 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     }
 
     fn is_always_false(&self, value: Id) -> bool {
-        self.mk(SSA::Constant(0)) == value
+        self.eqsat();
+        self.mk(SSA::Constant(0)) == self.find(value)
+    }
+
+    fn eqsat(&self) {
+        let mut dfg = self.dfg.borrow_mut();
+        let runner = Runner::<SSA, (), ()>::new(())
+            .with_iter_limit(10)
+            .with_egraph(take(&mut dfg))
+            .with_scheduler(SimpleScheduler)
+            .run(self.rws);
+        *dfg = runner.egraph;
+        dfg.rebuild();
     }
 }
 
@@ -291,22 +299,25 @@ mod tests {
 
     #[allow(unused_imports)]
     use super::*;
-    
+
     #[test]
     fn ssa1() {
         let program = r#"
-fn test(x) return x;
+fn test(x) return x != 7;
 "#;
         let parsed = ProgramParser::new().parse(&program).unwrap();
         let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
 
+        use BinaryOp::*;
         use SSA::*;
-        let id = dfg.lookup(Param(0)).unwrap();
+        let x = dfg.lookup(Param(0)).unwrap();
+        let seven = dfg.lookup(Constant(7)).unwrap();
+        let ne = dfg.lookup(Binary(NE, [x, seven])).unwrap();
 
         use Block::*;
-        assert_eq!(cfg, [Start, Return(0, id)]);
+        assert_eq!(cfg, [Start, Return(0, ne)]);
     }
-    
+
     #[test]
     fn ssa2() {
         let program = r#"
@@ -321,9 +332,18 @@ fn test(x) { if x {  } else {  } return x; }
         let not_x = dfg.lookup(Unary(Not, x)).unwrap();
 
         use Block::*;
-        assert_eq!(cfg, [Start, Child(0, x), Child(0, not_x), Merge(1, 2), Return(3, x)]);
+        assert_eq!(
+            cfg,
+            [
+                Start,
+                Child(0, x),
+                Child(0, not_x),
+                Merge(1, 2),
+                Return(3, x)
+            ]
+        );
     }
-    
+
     #[test]
     fn ssa3() {
         let program = r#"
@@ -341,7 +361,7 @@ fn test(x) { if 0 { } else { return x; } }
         use Block::*;
         assert_eq!(cfg, [Start, Child(0, not_zero), Return(1, x)]);
     }
-    
+
     #[test]
     fn ssa4() {
         let program = r#"
@@ -352,13 +372,22 @@ fn test(x) { while x { x = x + 1; } return x; }
 
         use SSA::*;
         use UnaryOp::*;
-        let phi = dfg.lookup(Knot(1, "x")).unwrap();
+        let phi = dfg.lookup(Knot(0)).unwrap();
         let not = dfg.lookup(Unary(Not, phi)).unwrap();
 
         use Block::*;
-        assert_eq!(cfg, [Start, Merge(0, 2), Child(1, phi), Child(1, not), Return(3, phi)]);
+        assert_eq!(
+            cfg,
+            [
+                Start,
+                Merge(0, 2),
+                Child(1, phi),
+                Child(1, not),
+                Return(3, phi)
+            ]
+        );
     }
-    
+
     #[test]
     fn ssa5() {
         let program = r#"
@@ -367,8 +396,8 @@ fn test(x) { while x { return x + 1; } return x + 1; }
         let parsed = ProgramParser::new().parse(&program).unwrap();
         let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
 
-        use SSA::*;
         use BinaryOp::*;
+        use SSA::*;
         use UnaryOp::*;
         let x = dfg.lookup(Param(0)).unwrap();
         let not_x = dfg.lookup(Unary(Not, x)).unwrap();
@@ -376,6 +405,73 @@ fn test(x) { while x { return x + 1; } return x + 1; }
         let add = dfg.lookup(Binary(Add, [x, one])).unwrap();
 
         use Block::*;
-        assert_eq!(cfg, [Start, Child(0, x), Return(1, add), Child(0, not_x), Return(3, add)]);
+        assert_eq!(
+            cfg,
+            [
+                Start,
+                Child(0, x),
+                Return(1, add),
+                Child(0, not_x),
+                Return(3, add)
+            ]
+        );
+    }
+
+    #[test]
+    fn ssa6() {
+        let program = r#"
+fn test(x) { if 0 * x {  } else {  } return x; }
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+
+        use SSA::*;
+        use UnaryOp::*;
+        let x = dfg.lookup(Param(0)).unwrap();
+        let zero = dfg.lookup(Constant(0)).unwrap();
+        let not = dfg.lookup(Unary(Not, zero)).unwrap();
+
+        use Block::*;
+        assert_eq!(
+            cfg,
+            [
+                Start,
+                Child(0, not),
+                Return(1, x)
+            ]
+        );
+    }
+
+    #[test]
+    fn ssa7() {
+        let program = r#"
+fn test(x) { y = 2; while y { if y * x == x + x { return 7; } y = y + 1; } return y; }
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+
+        use SSA::*;
+        use UnaryOp::*;
+        let one = dfg.lookup(Constant(1)).unwrap();
+        let two = dfg.lookup(Constant(2)).unwrap();
+        let not_two = dfg.lookup(Unary(Not, two)).unwrap();
+        let seven = dfg.lookup(Constant(7)).unwrap();
+        println!("one: {}", one);
+        println!("two: {}", two);
+        println!("not_two: {}", not_two);
+        println!("seven: {}", seven);
+
+        use Block::*;
+        assert_eq!(
+            cfg,
+            [
+                Start,
+                Child(0, two),
+                Child(1, one),
+                Return(2, seven),
+                Child(0, not_two),
+                Return(4, two),
+            ]
+        );
     }
 }
