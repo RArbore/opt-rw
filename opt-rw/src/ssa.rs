@@ -276,7 +276,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         if let Some(ctx) = ctx.handle_stmt(stmt) {
             self.remove_blocks(body_block);
             let header_block =
-                self.add_block(Block::Child(self.last_block, self.mk(SSA::Constant(1))));
+                self.add_block(Block::Start);
             let mut new_ctx = self.clone();
             ssa_intersection(&self.vars, &ctx.vars).for_each(|(name, _, _)| {
                 new_ctx
