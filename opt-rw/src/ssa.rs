@@ -1,7 +1,9 @@
 use core::cell::RefCell;
 use core::mem::take;
 
-use egg::{EGraph, Id, Rewrite, Runner, SimpleScheduler, define_language, rewrite};
+use egg::{
+    Analysis, DidMerge, EGraph, Id, Rewrite, Runner, SimpleScheduler, define_language, rewrite,
+};
 use rustc_hash::FxHashMap;
 
 use crate::ast::{BinaryOp, ExprAST, FuncAST, StmtAST, UnaryOp};
@@ -20,7 +22,7 @@ define_language! {
     }
 }
 
-fn mk_rewrites() -> Vec<Rewrite<SSA, ()>> {
+fn mk_rewrites() -> Vec<Rewrite<SSA, ConstantFolding>> {
     vec![
         rewrite!("comm-add"; "(Add ?a ?b)" => "(Add ?b ?a)"),
         rewrite!("comm-mul"; "(Mul ?a ?b)" => "(Mul ?b ?a)"),
@@ -35,6 +37,78 @@ fn mk_rewrites() -> Vec<Rewrite<SSA, ()>> {
     ]
 }
 
+fn meet(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(a), Some(b)) => {
+            assert_eq!(a, b);
+            Some(a)
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ConstantFolding;
+impl Analysis<SSA> for ConstantFolding {
+    type Data = Option<i64>;
+
+    fn make(egraph: &mut EGraph<SSA, Self>, enode: &SSA, _id: Id) -> Self::Data {
+        let c = |i: Id| egraph[i].data;
+        use BinaryOp::*;
+        use SSA::*;
+        use UnaryOp::*;
+        match enode {
+            Constant(cons) => Some(*cons),
+            Param(_) | Knot(_) => None,
+            Phi(_, inputs) => meet(c(inputs[0]), c(inputs[1])),
+            Unary(Neg, id) => c(*id).and_then(|cons| cons.checked_neg()),
+            Unary(Not, id) => c(*id).map(|cons| if cons == 0 { 1 } else { 0 }),
+            Binary(Add, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).and_then(|rhs| lhs.checked_add(rhs)))
+            }
+            Binary(Sub, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).and_then(|rhs| lhs.checked_sub(rhs)))
+            }
+            Binary(Mul, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).and_then(|rhs| lhs.checked_mul(rhs)))
+            }
+            Binary(EE, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).map(|rhs| (lhs == rhs) as i64))
+            }
+            Binary(NE, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).map(|rhs| (lhs != rhs) as i64))
+            }
+            Binary(LT, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).map(|rhs| (lhs < rhs) as i64))
+            }
+            Binary(LE, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).map(|rhs| (lhs <= rhs) as i64))
+            }
+            Binary(GT, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).map(|rhs| (lhs > rhs) as i64))
+            }
+            Binary(GE, inputs) => {
+                c(inputs[0]).and_then(|lhs| c(inputs[1]).map(|rhs| (lhs >= rhs) as i64))
+            }
+        }
+    }
+
+    fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
+        let m = meet(*a, b);
+        let d = DidMerge(*a != m, b != m);
+        *a = m;
+        d
+    }
+
+    fn modify(egraph: &mut EGraph<SSA, Self>, id: Id) {
+        if let Some(cons) = egraph[id].data {
+            let cons = egraph.add(SSA::Constant(cons));
+            egraph.union(id, cons);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Block {
     Start,
@@ -43,7 +117,7 @@ pub enum Block {
     Return(BlockId, Id),
 }
 
-pub type DFG = EGraph<SSA, ()>;
+pub type DFG = EGraph<SSA, ConstantFolding>;
 pub type CFG = Vec<Block>;
 type KnotMap<'a> = FxHashMap<(BlockId, &'a str), KnotId>;
 
@@ -54,11 +128,11 @@ struct SSACtx<'a, 'b> {
     cfg: &'b RefCell<CFG>,
     last_block: BlockId,
     knots: &'b RefCell<KnotMap<'a>>,
-    rws: &'b Vec<Rewrite<SSA, ()>>,
+    rws: &'b Vec<Rewrite<SSA, ConstantFolding>>,
 }
 
 pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
-    let dfg = RefCell::new(EGraph::new(()));
+    let dfg = RefCell::new(EGraph::new(ConstantFolding));
     let cfg = RefCell::new(CFG::default());
     let knots = RefCell::new(KnotMap::default());
 
@@ -77,7 +151,20 @@ pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
     ctx.last_block = ctx.add_block(Block::Start);
     ctx.handle_stmt(&func.body);
 
+    cfg.borrow_mut().iter_mut().for_each(|block| match block {
+        Block::Start | Block::Merge(_, _) => {}
+        Block::Child(_, id) | Block::Return(_, id) => *id = dfg.borrow().find(*id),
+    });
     (dfg.into_inner(), cfg.into_inner())
+}
+
+fn eqsat(egraph: &mut EGraph<SSA, ConstantFolding>, rws: &Vec<Rewrite<SSA, ConstantFolding>>) {
+    let runner = Runner::<SSA, ConstantFolding, ()>::new(ConstantFolding)
+        .with_iter_limit(10)
+        .with_egraph(take(egraph))
+        .with_scheduler(SimpleScheduler)
+        .run(rws);
+    *egraph = runner.egraph;
 }
 
 impl<'a, 'b> SSACtx<'a, 'b> {
@@ -221,9 +308,13 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         }
 
         let false_cond = self.mk(SSA::Unary(UnaryOp::Not, true_cond));
-        let exit_block = self.add_block(Block::Child(self.last_block, false_cond));
-        self.last_block = exit_block;
-        Some(self)
+        if !self.is_always_false(false_cond) {
+            let exit_block = self.add_block(Block::Child(self.last_block, false_cond));
+            self.last_block = exit_block;
+            Some(self)
+        } else {
+            None
+        }
     }
 
     fn handle_return(self, expr: &ExprAST) -> Option<Self> {
@@ -262,19 +353,8 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     }
 
     fn is_always_false(&self, value: Id) -> bool {
-        self.eqsat();
+        eqsat(&mut self.dfg.borrow_mut(), self.rws);
         self.mk(SSA::Constant(0)) == self.find(value)
-    }
-
-    fn eqsat(&self) {
-        let mut dfg = self.dfg.borrow_mut();
-        let runner = Runner::<SSA, (), ()>::new(())
-            .with_iter_limit(10)
-            .with_egraph(take(&mut dfg))
-            .with_scheduler(SimpleScheduler)
-            .run(self.rws);
-        *dfg = runner.egraph;
-        dfg.rebuild();
     }
 }
 
@@ -432,14 +512,7 @@ fn test(x) { if 0 * x {  } else {  } return x; }
         let not = dfg.lookup(Unary(Not, zero)).unwrap();
 
         use Block::*;
-        assert_eq!(
-            cfg,
-            [
-                Start,
-                Child(0, not),
-                Return(1, x)
-            ]
-        );
+        assert_eq!(cfg, [Start, Child(0, not), Return(1, x)]);
     }
 
     #[test]
@@ -451,27 +524,14 @@ fn test(x) { y = 2; while y { if y * x == x + x { return 7; } y = y + 1; } retur
         let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
 
         use SSA::*;
-        use UnaryOp::*;
         let one = dfg.lookup(Constant(1)).unwrap();
         let two = dfg.lookup(Constant(2)).unwrap();
-        let not_two = dfg.lookup(Unary(Not, two)).unwrap();
         let seven = dfg.lookup(Constant(7)).unwrap();
-        println!("one: {}", one);
-        println!("two: {}", two);
-        println!("not_two: {}", not_two);
-        println!("seven: {}", seven);
 
         use Block::*;
         assert_eq!(
             cfg,
-            [
-                Start,
-                Child(0, two),
-                Child(1, one),
-                Return(2, seven),
-                Child(0, not_two),
-                Return(4, two),
-            ]
+            [Start, Child(0, two), Child(1, one), Return(2, seven),]
         );
     }
 }
