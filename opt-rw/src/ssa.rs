@@ -165,6 +165,9 @@ pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
     }
     ctx.last_block = ctx.add_block(Block::Start);
     ctx.handle_stmt(&func.body);
+    // Explicitly perform equality saturation after the whole SSA program is built, since equality
+    // saturation is only called when needed to characterize control flow while building.
+    eqsat(&mut dfg.borrow_mut(), &rws);
 
     // Explicitly canonicalize the IDs in the CFG, since there's no guarantee that rewriting didn't
     // simplify guard conditions or returned values after the CFG was created.
