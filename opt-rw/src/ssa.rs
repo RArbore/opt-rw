@@ -121,7 +121,8 @@ fn constant_fold_meet(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 pub enum Block {
     Start,
     Child(BlockId, Id),
-    Merge(BlockId, BlockId),
+    IfElseMerge(BlockId, BlockId),
+    LoopMerge(BlockId, BlockId),
     Return(BlockId, Id),
 }
 
@@ -168,7 +169,7 @@ pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
     // Explicitly canonicalize the IDs in the CFG, since there's no guarantee that rewriting didn't
     // simplify guard conditions or returned values after the CFG was created.
     cfg.borrow_mut().iter_mut().for_each(|block| match block {
-        Block::Start | Block::Merge(_, _) => {}
+        Block::Start | Block::IfElseMerge(_, _) | Block::LoopMerge(_, _) => {}
         Block::Child(_, id) | Block::Return(_, id) => *id = dfg.borrow().find(*id),
     });
     (dfg.into_inner(), cfg.into_inner())
@@ -223,7 +224,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     // reachable). For example, handle_return always returns None, since control flow can never reach
     // right after a return statement. The handle_* functions are only ever called on statements
     // which are possibly reachable.
-    
+
     fn handle_stmt(self, stmt: &'a StmtAST) -> Option<Self> {
         use StmtAST::*;
         match stmt {
@@ -288,7 +289,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
             (Some(then_ctx), Some(else_ctx)) => {
                 // Control flow can reach after both branches, so variables need to be merged with
                 // phi nodes.
-                let block = self.add_block(Block::Merge(then_ctx.last_block, else_ctx.last_block));
+                let block = self.add_block(Block::IfElseMerge(then_ctx.last_block, else_ctx.last_block));
                 ssa_intersection(&then_ctx.vars, &else_ctx.vars).for_each(
                     |(name, then_value, else_value)| {
                         self.vars
@@ -343,7 +344,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
 
             // Tie the control flow knot, now that we have the last block in the body.
             self.set_block(
-                Block::Merge(self.last_block, new_ctx.last_block),
+                Block::LoopMerge(self.last_block, new_ctx.last_block),
                 header_block,
             );
             let mut exit_ctx = self.clone();
@@ -485,7 +486,7 @@ fn test(x) { if x {  } else {  } return x; }
                 Start,
                 Child(0, x),
                 Child(0, not_x),
-                Merge(1, 2),
+                IfElseMerge(1, 2),
                 Return(3, x)
             ]
         );
@@ -528,7 +529,7 @@ fn test(x) { while x { x = x + 1; } return x; }
             [
                 Start,
                 Start,
-                Merge(0, 3),
+                LoopMerge(0, 3),
                 Child(2, phi),
                 Child(2, not),
                 Return(4, phi)
