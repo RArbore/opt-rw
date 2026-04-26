@@ -32,36 +32,31 @@ pub fn extract<L, A, F>(egraph: &EGraph<L, A>, cf: F) -> Extraction<L>
 where
     L: Language,
     A: Analysis<L>,
-    F: Fn(&L, &Extraction<L>) -> u128,
+    F: Fn(&L, &Extraction<L>) -> Option<u128>,
 {
     let mut costs: Extraction<L> = Extraction::default();
     let mut priority: BinaryHeap<QueueElement<L>> = BinaryHeap::new();
     let mut parents: FxHashMap<Id, Vec<L>> = FxHashMap::default();
-    let mut num_unknown_children: FxHashMap<L, usize> = FxHashMap::default();
 
     // Initialize data structures:
-    // 1. Count the number of unique children (e-class IDs) per node.
-    // 2. Assemble the "parents" (user nodes) of each e-class ID.
-    // 3. Put leaf nodes into priority queue.
-    let mut child_dedup: FxHashSet<Id> = FxHashSet::default();
+    // 1. Assemble the "parents" (user nodes) of each e-class ID.
+    // 2. Put leaf nodes into priority queue.
     for class in egraph.classes() {
         for node in class.iter() {
             node.for_each(|child| {
-                child_dedup.insert(child);
+                let parents = parents.entry(child).or_default();
+                if !parents.contains(node) {
+                    parents.push(node.clone());
+                }
             });
-            num_unknown_children.insert(node.clone(), child_dedup.len());
-            for child in child_dedup.drain() {
-                parents.entry(child).or_default().push(node.clone());
-            }
 
             // Assuming the cost function is "superior" in Knuth's parlance, starting off by just
             // inserting leaf nodes into the priority queue won't miss out on potentially cheaper
             // extraction candidates.
             if node.is_leaf() {
-                let cost = cf(&node, &costs);
                 priority.push(QueueElement {
                     node: node.clone(),
-                    cost,
+                    cost: cf(&node, &costs).unwrap(),
                 });
             }
         }
@@ -77,7 +72,7 @@ where
 
         // Once an e-class has a cost, that cost won't get better later. Transitively, the cost of
         // nodes also won't change once its children e-classes have been extracted.
-        assert_eq!(cost, cf(&node, &costs));
+        assert_eq!(cost, cf(&node, &costs).unwrap());
         costs.insert(id, (cost, node));
         for parent in parents.entry(id).or_default() {
             // A parent of an e-class may be in an e-class we've already extracted.
@@ -85,16 +80,13 @@ where
                 continue;
             }
 
-            // Once all of the children of a parent node (including the current child) have been
-            // visited, that node's cost can be calculated and pushed onto the queue.
-            let num_unknown = num_unknown_children.get_mut(parent).unwrap();
-            *num_unknown -= 1;
-            if *num_unknown == 0 {
-                let cost = cf(parent, &costs);
+            // Once a parent node's cost can be calculated (its children e-classes have all been)
+            // assigned costs, then it can be added to the queue.
+            if let Some(cost) = cf(parent, &costs) {
                 priority.push(QueueElement {
                     node: parent.clone(),
                     cost,
-                })
+                });
             }
         }
     }
@@ -114,24 +106,24 @@ mod tests {
     use super::*;
 
     #[allow(dead_code)]
-    fn placeholder_cost(node: &SSA, costs: &Extraction<SSA>) -> u128 {
+    fn placeholder_cost(node: &SSA, costs: &Extraction<SSA>) -> Option<u128> {
         use BinaryOp::*;
         use SSA::*;
         use UnaryOp::*;
-        match node {
+        Some(match node {
             Constant(_) => 1,
             Param(_) => 2,
-            Phi(_, inputs) => core::cmp::max(costs[&inputs[0]].0, costs[&inputs[1]].0),
+            Phi(_, inputs) => core::cmp::max(costs.get(&inputs[0])?.0, costs.get(&inputs[1])?.0),
             Unary(op, input) => {
-                costs[&input].0
+                costs.get(&input)?.0
                     + match op {
                         Neg => 4,
                         Not => 3,
                     }
             }
             Binary(op, inputs) => {
-                costs[&inputs[0]].0
-                    + costs[&inputs[1]].0
+                costs.get(&inputs[0])?.0
+                    + costs.get(&inputs[1])?.0
                     + match op {
                         Add => 5,
                         Sub => 5,
@@ -145,7 +137,7 @@ mod tests {
                     }
             }
             Knot(_) => todo!(),
-        }
+        })
     }
 
     #[test]
