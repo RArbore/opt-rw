@@ -94,6 +94,99 @@ where
     costs
 }
 
+pub type DualExtraction<L> = [FxHashMap<Id, (u128, L)>; 2];
+
+pub fn dual_extract<L, A, F1, F2>(egraph: &EGraph<L, A>, cf1: F1, cf2: F2) -> DualExtraction<L>
+where
+    L: Language,
+    A: Analysis<L>,
+    F1: Fn(&L, &DualExtraction<L>) -> Option<u128>,
+    F2: Fn(&L, &DualExtraction<L>) -> Option<u128>,
+{
+    let mut costs: DualExtraction<L> = DualExtraction::default();
+    let mut priority1: BinaryHeap<QueueElement<L>> = BinaryHeap::new();
+    let mut priority2: BinaryHeap<QueueElement<L>> = BinaryHeap::new();
+    let mut parents: FxHashMap<Id, Vec<L>> = FxHashMap::default();
+
+    let mut child_dedup: FxHashSet<Id> = FxHashSet::default();
+    for class in egraph.classes() {
+        for node in class.iter() {
+            node.for_each(|child| {
+                child_dedup.insert(child);
+            });
+            for child in child_dedup.drain() {
+                parents.entry(child).or_default().push(node.clone());
+            }
+            if node.is_leaf() {
+                priority1.push(QueueElement {
+                    node: node.clone(),
+                    cost: cf1(&node, &costs).unwrap(),
+                });
+                priority2.push(QueueElement {
+                    node: node.clone(),
+                    cost: cf2(&node, &costs).unwrap(),
+                });
+            }
+        }
+    }
+
+    while !priority1.is_empty() || !priority2.is_empty() {
+        while let Some(QueueElement { node, cost }) = priority1.pop() {
+            let id = egraph.lookup(node.clone()).unwrap();
+            if costs[0].contains_key(&id) {
+                continue;
+            }
+            costs[0].insert(id, (cost, node));
+            for parent in parents.entry(id).or_default() {
+                if !costs[0].contains_key(&egraph.lookup(parent.clone()).unwrap())
+                    && let Some(cost) = cf1(parent, &costs)
+                {
+                    priority1.push(QueueElement {
+                        node: parent.clone(),
+                        cost,
+                    });
+                }
+                if !costs[1].contains_key(&egraph.lookup(parent.clone()).unwrap())
+                    && let Some(cost) = cf2(parent, &costs)
+                {
+                    priority2.push(QueueElement {
+                        node: parent.clone(),
+                        cost,
+                    });
+                }
+            }
+        }
+
+        while let Some(QueueElement { node, cost }) = priority2.pop() {
+            let id = egraph.lookup(node.clone()).unwrap();
+            if costs[1].contains_key(&id) {
+                continue;
+            }
+            costs[1].insert(id, (cost, node));
+            for parent in parents.entry(id).or_default() {
+                if !costs[0].contains_key(&egraph.lookup(parent.clone()).unwrap())
+                    && let Some(cost) = cf1(parent, &costs)
+                {
+                    priority1.push(QueueElement {
+                        node: parent.clone(),
+                        cost,
+                    });
+                }
+                if !costs[1].contains_key(&egraph.lookup(parent.clone()).unwrap())
+                    && let Some(cost) = cf2(parent, &costs)
+                {
+                    priority2.push(QueueElement {
+                        node: parent.clone(),
+                        cost,
+                    });
+                }
+            }
+        }
+    }
+
+    costs
+}
+
 mod tests {
     #[allow(unused_imports)]
     use crate::ast::{BinaryOp, UnaryOp};
@@ -166,5 +259,34 @@ fn test(x) return ((2 * x) - (2 * x)) * ((2 * x) - (2 * x));
             panic!()
         };
         assert_eq!(costs[&id].0, 66);
+    }
+
+    #[allow(dead_code)]
+    fn cost_a(node: &SSA, costs: &DualExtraction<SSA>) -> Option<u128> {
+        placeholder_cost(node, &costs[0])
+    }
+
+    #[allow(dead_code)]
+    fn cost_b(node: &SSA, costs: &DualExtraction<SSA>) -> Option<u128> {
+        if let SSA::Binary(BinaryOp::Add, _) = node {
+            None
+        } else {
+            placeholder_cost(node, &costs[0])
+        }
+    }
+
+    #[test]
+    fn dual_extract1() {
+        let program = r#"
+fn test(x) return 2 * (2 * x);
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+        let costs = dual_extract(&dfg, cost_a, cost_b);
+        let Block::Return(_, id) = cfg[1] else {
+            panic!()
+        };
+        assert_eq!(costs[0][&id].0, 23);
+        assert_eq!(costs[1][&id].0, 30);
     }
 }
