@@ -47,7 +47,10 @@ fn mk_rewrites() -> Vec<Rewrite<SSA, IntervalAnalysis>> {
 
 // Simple interval analysis.
 #[derive(Default)]
-pub struct IntervalAnalysis;
+pub struct IntervalAnalysis {
+    knot_intervals: Vec<Interval>,
+}
+
 impl Analysis<SSA> for IntervalAnalysis {
     type Data = Interval;
 
@@ -56,8 +59,9 @@ impl Analysis<SSA> for IntervalAnalysis {
         use SSA::*;
         match enode {
             Constant(cons) => Interval::from_constant(*cons),
-            Param(_) | Knot(_) => Interval::top(),
-            Phi(_, inputs) => c(inputs[0]).meet(&c(inputs[1])),
+            Param(_) => Interval::top(),
+            Knot(id) => egraph.analysis.knot_intervals[*id],
+            Phi(_, inputs) => c(inputs[0]).join(&c(inputs[1])),
             Unary(op, id) => c(*id).forward_unary(*op),
             Binary(op, inputs) => c(inputs[0]).forward_binary(&c(inputs[1]), *op),
         }
@@ -95,7 +99,7 @@ pub enum Block {
 pub type DFG = EGraph<SSA, IntervalAnalysis>;
 pub type CFG = Vec<Block>;
 // Intern pairs of blocks and variable names into KnotIds.
-type KnotMap<'a> = FxHashMap<(BlockId, &'a str), KnotId>;
+type KnotMap<'a> = FxHashMap<(BlockId, &'a str, Interval), KnotId>;
 
 // The flow sensitive context used for building SSA. The main things the context holds are 1) a
 // mapping of variables to e-class IDs and 2) the current block. The rest of the fields are
@@ -112,7 +116,9 @@ struct SSACtx<'a, 'b> {
 }
 
 pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
-    let dfg = RefCell::new(EGraph::new(IntervalAnalysis));
+    let dfg = RefCell::new(EGraph::new(IntervalAnalysis {
+        knot_intervals: vec![],
+    }));
     let cfg = RefCell::new(CFG::default());
     let knots = RefCell::new(KnotMap::default());
 
@@ -145,7 +151,7 @@ pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
 }
 
 fn eqsat(egraph: &mut EGraph<SSA, IntervalAnalysis>, rws: &Vec<Rewrite<SSA, IntervalAnalysis>>) {
-    let runner = Runner::<SSA, IntervalAnalysis, ()>::new(IntervalAnalysis)
+    let runner = Runner::<SSA, IntervalAnalysis, ()>::new(IntervalAnalysis::default())
         .with_iter_limit(10)
         .with_egraph(take(egraph))
         .with_scheduler(SimpleScheduler)
@@ -178,12 +184,14 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     }
 
     // Intern a block ID and variable name into a knot.
-    fn knot(&self, block: BlockId, var: &'a str) -> KnotId {
-        if let Some(id) = self.knots.borrow().get(&(block, var)) {
+    fn knot(&self, block: BlockId, var: &'a str, interval: Interval) -> KnotId {
+        let knot = (block, var, interval);
+        if let Some(id) = self.knots.borrow().get(&knot) {
             *id
         } else {
             let id = self.knots.borrow().len();
-            self.knots.borrow_mut().insert((block, var), id);
+            self.knots.borrow_mut().insert(knot, id);
+            self.dfg.borrow_mut().analysis.knot_intervals.push(interval);
             id
         }
     }
@@ -282,58 +290,96 @@ impl<'a, 'b> SSACtx<'a, 'b> {
 
         // Start by assuming that control flow cannot reach after the body of the while. In this
         // case, the while basically acts as an if else.
-        let body_block = self.add_block(Block::Child(self.last_block, true_cond));
-        let mut ctx = self.clone();
-        ctx.last_block = body_block;
+        let mut header_block = self.add_block(Block::Child(self.last_block, true_cond));
+        let mut after_body_ctx = self.clone();
+        after_body_ctx.last_block = header_block;
 
-        if let Some(ctx) = ctx.handle_stmt(stmt) {
-            // The blocks we just created assumed that the while cannot loop. However, since after
-            // the body is reachable, the while can loop. Therefore, we need to create phis and a
-            // control flow cycle with a loop header. We explicitly remove the blocks we just
-            // created, since a deterministic CFG cannot have multiple blocks succeeding a block with
-            // guard conditions that simultaneously evaluate to true. We do not explicitly remove
-            // e-nodes that we created in the e-graph, since they don't harm us (though they will now
-            // be dead).
-            self.remove_blocks(body_block);
-            // Create a header block with Block::Start as a placeholder.
-            let header_block = self.add_block(Block::Start);
-            let mut new_ctx = self.clone();
-            // Create the e-class IDs for the phis. We can't actually create the phis yet, since we
-            // don't have the e-class IDs for the values on the loop's back edge, so we add
-            // placeholder e-nodes, which we call "knots".
-            ssa_intersection(&self.vars, &ctx.vars).for_each(|(name, _, _)| {
-                new_ctx
-                    .vars
-                    .insert(name, self.mk(SSA::Knot(self.knot(header_block, name))));
-            });
-            // Now, we can create the loop body properly.
-            true_cond = new_ctx.handle_expr(cond);
-            let new_body_block = self.add_block(Block::Child(header_block, true_cond));
-            new_ctx.last_block = new_body_block;
-            let new_ctx = new_ctx.handle_stmt(stmt).unwrap();
+        if let Some(mut after_body_ctx) = after_body_ctx.handle_stmt(stmt) {
+            // For widening and other conveniences, keep around the last intervals known at the
+            // beginning of the loop for each variable that we will build a phi for.
+            let mut previous_intervals: FxHashMap<&'a str, Interval> = FxHashMap::default();
 
-            // Tie the control flow knot, now that we have the last block in the body.
-            self.set_block(
-                Block::LoopMerge(self.last_block, new_ctx.last_block),
-                header_block,
-            );
-            let mut exit_ctx = self.clone();
-            // Tie the phi knots, now that we have e-class IDs on the loop back edge.
-            ssa_intersection(&self.vars, &new_ctx.vars).for_each(
-                |(name, init_value, loop_value)| {
-                    let knot = self
-                        .lookup(SSA::Knot(self.knot(header_block, name)))
-                        .unwrap();
-                    let phi = self.mk(SSA::Phi(header_block, [init_value, loop_value]));
-                    self.union(knot, phi);
-                    exit_ctx.vars.insert(name, self.find(knot));
-                },
-            );
-            exit_ctx.last_block = header_block;
-            self = exit_ctx;
+            loop {
+                let mut fixpoint_reached = true;
+                let differences: Vec<_> =
+                    ssa_intersection(&self.vars, &after_body_ctx.vars).collect();
+                differences
+                    .iter()
+                    .for_each(|(name, init_value, loop_value)| {
+                        let init_interval = self.interval(*init_value);
+                        let loop_interval = self.interval(*loop_value);
+                        let mut knot_interval = init_interval.join(&loop_interval);
+                        // A fixpoint has been reached once the intervals derived for the variables
+                        // at the loop header agree with the join of intervals from outside the loop
+                        // and from the loop back edge.
+                        if let Some(previous_interval) = previous_intervals.get(name) {
+                            if *previous_interval != knot_interval {
+                                knot_interval = previous_interval.widen(&knot_interval);
+                                fixpoint_reached = false;
+                            }
+                        } else {
+                            // Since previous_intervals starts out empty, the first iteration of the
+                            // main loop will never reach a fixpoint. This is intended, since the
+                            // loop needs to execute at least once to generate the body of the loop
+                            // with knots and a header block for knot tying.
+                            fixpoint_reached = false;
+                        }
+                        previous_intervals.insert(name, knot_interval);
+                    });
+
+                if fixpoint_reached {
+                    // We only create phis once the interval on the knot is sound, since we don't
+                    // index phis on the current interval (creating a phi too early would result in
+                    // all future knots being equal, which is unsound).
+                    differences
+                        .iter()
+                        .for_each(|(name, init_value, loop_value)| {
+                            let knot = self
+                                .lookup(SSA::Knot(self.knot(
+                                    header_block,
+                                    name,
+                                    previous_intervals[name],
+                                )))
+                                .unwrap();
+                            let phi = self.mk(SSA::Phi(header_block, [*init_value, *loop_value]));
+                            self.union(knot, phi);
+                            self.vars.insert(name, self.find(phi));
+                        });
+                    // Tie the knot in the CFG.
+                    self.set_block(
+                        Block::LoopMerge(self.last_block, after_body_ctx.last_block),
+                        header_block,
+                    );
+                    self.last_block = header_block;
+                    break;
+                }
+
+                // Re-execute the loop body with a new header block. Create knots with the desired
+                // intervals for this iteration.
+                self.remove_blocks(header_block);
+                header_block = self.add_block(Block::Start);
+                let mut new_ctx = self.clone();
+                new_ctx.last_block = header_block;
+                ssa_intersection(&self.vars, &after_body_ctx.vars).for_each(|(name, _, _)| {
+                    new_ctx.vars.insert(
+                        name,
+                        self.mk(SSA::Knot(self.knot(
+                            header_block,
+                            name,
+                            previous_intervals[name],
+                        ))),
+                    );
+                });
+                true_cond = new_ctx.handle_expr(cond);
+                let new_body_block = self.add_block(Block::Child(header_block, true_cond));
+                new_ctx.last_block = new_body_block;
+                after_body_ctx = new_ctx.handle_stmt(stmt).unwrap();
+            }
         }
 
-        // At this point, self is always a context "at" the branching point for the loop.
+        // At this point, self is always a context "at" the branching point for the loop. This is the
+        // block preceding the loop if after the body is unreachable or the header of the loop if
+        // after the loop is reachable.
         let false_cond = self.mk(SSA::Unary(UnaryOp::Not, true_cond));
         // If the while condition is always true, then control flow cannot reach after the while.
         if self.is_always_false(false_cond) {
@@ -382,6 +428,10 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         self.dfg.borrow().find(id)
     }
 
+    fn interval(&self, id: Id) -> Interval {
+        self.dfg.borrow()[id].data
+    }
+
     // We are lazy about when we actually perform equality saturation. The only time where rewriting
     // and analysis are important for optimistic SSA translation is when we are determining what
     // control flow is possible. This always takes the form of determining whether a particular value
@@ -390,7 +440,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     // relatively simple.
     fn is_always_false(&self, value: Id) -> bool {
         eqsat(&mut self.dfg.borrow_mut(), self.rws);
-        self.dfg.borrow()[value].data.is_cons(0)
+        self.interval(value).is_cons(0)
     }
 }
 
@@ -482,28 +532,15 @@ fn test(x) { if 0 { } else { return x; } }
     #[test]
     fn ssa4() {
         let program = r#"
-fn test(x) { while x { x = x + 1; } return x; }
+fn test() { x = -5; while x { x = x + (1 * 3); } return x; }
 "#;
         let parsed = ProgramParser::new().parse(&program).unwrap();
         let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
 
-        use SSA::*;
-        use UnaryOp::*;
-        let phi = dfg.lookup(Knot(0)).unwrap();
-        let not = dfg.lookup(Unary(Not, phi)).unwrap();
-
-        use Block::*;
-        assert_eq!(
-            cfg,
-            [
-                Start,
-                Start,
-                LoopMerge(0, 3),
-                Child(2, phi),
-                Child(2, not),
-                Return(4, phi)
-            ]
-        );
+        let Some(Block::Return(_, id)) = cfg.last() else {
+            panic!()
+        };
+        assert_eq!(dfg[*id].data, Interval::from_low(-5));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use core::cmp::Ordering;
 
 use crate::ast::{BinaryOp, UnaryOp};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Bound {
     MinusInfinity,
     Integer(i64),
@@ -145,7 +145,7 @@ impl PartialOrd for Bound {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Interval {
     low: Bound,
     high: Bound,
