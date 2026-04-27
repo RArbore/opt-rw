@@ -187,18 +187,14 @@ where
     costs
 }
 
+#[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use crate::ast::{BinaryOp, UnaryOp};
-    #[allow(unused_imports)]
     use crate::grammar::ProgramParser;
-    #[allow(unused_imports)]
     use crate::ssa::{Block, SSA, optimistic_rewriting};
 
-    #[allow(unused_imports)]
     use super::*;
 
-    #[allow(dead_code)]
     fn placeholder_cost(node: &SSA, costs: &Extraction<SSA>) -> Option<u128> {
         use BinaryOp::*;
         use SSA::*;
@@ -261,12 +257,10 @@ fn test(x) return ((2 * x) * (2 * x)) * ((2 * x) * (2 * x));
         assert_eq!(costs[&id].0, 96);
     }
 
-    #[allow(dead_code)]
     fn cost_a(node: &SSA, costs: &DualExtraction<SSA>) -> Option<u128> {
         placeholder_cost(node, &costs[0])
     }
 
-    #[allow(dead_code)]
     fn cost_b(node: &SSA, costs: &DualExtraction<SSA>) -> Option<u128> {
         if let SSA::Binary(BinaryOp::Add, _) = node {
             None

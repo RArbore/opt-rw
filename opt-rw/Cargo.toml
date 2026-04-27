@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 derive_more = { version = "*", features = ["from_str"] }
 egg = "*"
+rand = "*"
 rustc-hash = "*"
 lalrpop-util = { version = "*", features = ["lexer", "unicode"] }
 

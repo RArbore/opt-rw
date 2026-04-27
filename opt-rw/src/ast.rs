@@ -119,11 +119,10 @@ impl Display for BinaryOp {
     }
 }
 
+#[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use crate::grammar::ProgramParser;
 
-    #[allow(unused_imports)]
     use super::*;
 
     #[test]
