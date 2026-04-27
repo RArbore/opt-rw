@@ -27,10 +27,14 @@ define_language! {
 
 fn mk_rewrites() -> Vec<Rewrite<SSA, ConstantFolding>> {
     vec![
+        rewrite!("not-not"; "(Not (Not ?a))" => "?a"),
         rewrite!("comm-add"; "(Add ?a ?b)" => "(Add ?b ?a)"),
         rewrite!("comm-mul"; "(Mul ?a ?b)" => "(Mul ?b ?a)"),
-        rewrite!("mul-1"; "(Mul ?a 1)" => "?a"),
         rewrite!("add-0"; "(Add ?a 0)" => "?a"),
+        rewrite!("sub-0"; "(Sub ?a 0)" => "?a"),
+        rewrite!("sub-0-neg"; "(Sub 0 ?a)" => "(Neg ?a)"),
+        rewrite!("sub-same"; "(Sub ?a ?a)" => "0"),
+        rewrite!("mul-1"; "(Mul ?a 1)" => "?a"),
         rewrite!("mul-0"; "(Mul ?a 0)" => "0"),
         rewrite!("mul-2"; "(Mul ?a 2)" => "(Add ?a ?a)"),
         rewrite!("not-ee"; "(Not (EE ?a ?b))" => "(NE ?a ?b)"),

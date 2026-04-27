@@ -229,7 +229,7 @@ mod tests {
                         GE => 5,
                     }
             }
-            Knot(_) => todo!(),
+            Knot(_) => return None,
         })
     }
 
@@ -250,7 +250,7 @@ fn test(x) return 2 * x;
     #[test]
     fn extract2() {
         let program = r#"
-fn test(x) return ((2 * x) - (2 * x)) * ((2 * x) - (2 * x));
+fn test(x) return ((2 * x) * (2 * x)) * ((2 * x) * (2 * x));
 "#;
         let parsed = ProgramParser::new().parse(&program).unwrap();
         let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
@@ -258,7 +258,7 @@ fn test(x) return ((2 * x) - (2 * x)) * ((2 * x) - (2 * x));
         let Block::Return(_, id) = cfg[1] else {
             panic!()
         };
-        assert_eq!(costs[&id].0, 66);
+        assert_eq!(costs[&id].0, 96);
     }
 
     #[allow(dead_code)]
