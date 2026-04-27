@@ -11,8 +11,8 @@ use crate::interval::Interval;
 
 pub type BlockId = usize;
 // define_language!, as far as I can tell, doesn't appreciate multiple tuple fields being non-Id
-// things. A KnotId corresponds to a pair of a block and a variable name. This also avoids needing a
-// lifetime for the reference to the variable name.
+// things. A KnotId corresponds to a tuple of a block, a variable name, and an interval. This also
+// avoids needing a lifetime for the reference to the variable name.
 type KnotId = usize;
 
 define_language! {
@@ -183,7 +183,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         }
     }
 
-    // Intern a block ID and variable name into a knot.
+    // Intern a block ID, a variable name, and an interval into a knot.
     fn knot(&self, block: BlockId, var: &'a str, interval: Interval) -> KnotId {
         let knot = (block, var, interval);
         if let Some(id) = self.knots.borrow().get(&knot) {
