@@ -7,6 +7,7 @@ use egg::{
 use rustc_hash::FxHashMap;
 
 use crate::ast::{BinaryOp, ExprAST, FuncAST, StmtAST, UnaryOp};
+use crate::interval::Interval;
 
 pub type BlockId = usize;
 // define_language!, as far as I can tell, doesn't appreciate multiple tuple fields being non-Id
@@ -25,7 +26,7 @@ define_language! {
     }
 }
 
-fn mk_rewrites() -> Vec<Rewrite<SSA, ConstantFolding>> {
+fn mk_rewrites() -> Vec<Rewrite<SSA, IntervalAnalysis>> {
     vec![
         rewrite!("not-not-not"; "(Not (Not (Not ?a)))" => "(Not ?a)"),
         rewrite!("comm-add"; "(Add ?a ?b)" => "(Add ?b ?a)"),
@@ -44,74 +45,35 @@ fn mk_rewrites() -> Vec<Rewrite<SSA, ConstantFolding>> {
     ]
 }
 
-// Simple constant folding analysis. Note that constant folding is simple enough that we don't need
-// to optimistically propagate it around loops (in particular, if a phi needs to be created in a
-// loop, that implies that constant folding couldn't determine that the initial and back edge inputs
-// to the loop were the same constant).
+// Simple interval analysis.
 #[derive(Default)]
-pub struct ConstantFolding;
-impl Analysis<SSA> for ConstantFolding {
-    type Data = Option<i64>;
+pub struct IntervalAnalysis;
+impl Analysis<SSA> for IntervalAnalysis {
+    type Data = Interval;
 
     fn make(egraph: &mut EGraph<SSA, Self>, enode: &SSA, _id: Id) -> Self::Data {
         let c = |i: Id| egraph[i].data;
         use SSA::*;
         match enode {
-            Constant(cons) => Some(*cons),
-            Param(_) | Knot(_) => None,
-            Phi(_, inputs) => constant_fold_meet(c(inputs[0]), c(inputs[1])),
-            Unary(op, id) => c(*id).and_then(|cons| constant_fold_unary_transfer(*op, cons)),
-            Binary(op, inputs) => c(inputs[0]).and_then(|lhs| {
-                c(inputs[1]).and_then(|rhs| constant_fold_binary_transfer(*op, lhs, rhs))
-            }),
+            Constant(cons) => Interval::from_constant(*cons),
+            Param(_) | Knot(_) => Interval::top(),
+            Phi(_, inputs) => c(inputs[0]).meet(&c(inputs[1])),
+            Unary(op, id) => c(*id).forward_unary(*op),
+            Binary(op, inputs) => c(inputs[0]).forward_binary(&c(inputs[1]), *op),
         }
     }
 
     fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
-        let m = constant_fold_meet(*a, b);
+        let m = a.meet(&b);
         let d = DidMerge(*a != m, b != m);
         *a = m;
         d
     }
 
     fn modify(egraph: &mut EGraph<SSA, Self>, id: Id) {
-        if let Some(cons) = egraph[id].data {
+        if let Some(cons) = egraph[id].data.try_constant() {
             let cons = egraph.add(SSA::Constant(cons));
             egraph.union(id, cons);
-        }
-    }
-}
-
-fn constant_fold_unary_transfer(op: UnaryOp, input: i64) -> Option<i64> {
-    use UnaryOp::*;
-    match op {
-        Neg => input.checked_neg(),
-        Not => Some(if input == 0 { 1 } else { 0 }),
-    }
-}
-
-fn constant_fold_binary_transfer(op: BinaryOp, lhs: i64, rhs: i64) -> Option<i64> {
-    use BinaryOp::*;
-    match op {
-        Add => lhs.checked_add(rhs),
-        Sub => lhs.checked_sub(rhs),
-        Mul => lhs.checked_mul(rhs),
-        EE => Some((lhs == rhs) as i64),
-        NE => Some((lhs != rhs) as i64),
-        LT => Some((lhs < rhs) as i64),
-        LE => Some((lhs <= rhs) as i64),
-        GT => Some((lhs > rhs) as i64),
-        GE => Some((lhs >= rhs) as i64),
-    }
-}
-
-fn constant_fold_meet(a: Option<i64>, b: Option<i64>) -> Option<i64> {
-    match (a, b) {
-        (None, None) => None,
-        (Some(m), None) | (None, Some(m)) => Some(m),
-        (Some(a), Some(b)) => {
-            assert_eq!(a, b);
-            Some(a)
         }
     }
 }
@@ -130,7 +92,7 @@ pub enum Block {
     Return(BlockId, Id),
 }
 
-pub type DFG = EGraph<SSA, ConstantFolding>;
+pub type DFG = EGraph<SSA, IntervalAnalysis>;
 pub type CFG = Vec<Block>;
 // Intern pairs of blocks and variable names into KnotIds.
 type KnotMap<'a> = FxHashMap<(BlockId, &'a str), KnotId>;
@@ -146,11 +108,11 @@ struct SSACtx<'a, 'b> {
     dfg: &'b RefCell<DFG>,
     cfg: &'b RefCell<CFG>,
     knots: &'b RefCell<KnotMap<'a>>,
-    rws: &'b Vec<Rewrite<SSA, ConstantFolding>>,
+    rws: &'b Vec<Rewrite<SSA, IntervalAnalysis>>,
 }
 
 pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
-    let dfg = RefCell::new(EGraph::new(ConstantFolding));
+    let dfg = RefCell::new(EGraph::new(IntervalAnalysis));
     let cfg = RefCell::new(CFG::default());
     let knots = RefCell::new(KnotMap::default());
 
@@ -182,8 +144,8 @@ pub fn optimistic_rewriting(func: &FuncAST) -> (DFG, CFG) {
     (dfg.into_inner(), cfg.into_inner())
 }
 
-fn eqsat(egraph: &mut EGraph<SSA, ConstantFolding>, rws: &Vec<Rewrite<SSA, ConstantFolding>>) {
-    let runner = Runner::<SSA, ConstantFolding, ()>::new(ConstantFolding)
+fn eqsat(egraph: &mut EGraph<SSA, IntervalAnalysis>, rws: &Vec<Rewrite<SSA, IntervalAnalysis>>) {
+    let runner = Runner::<SSA, IntervalAnalysis, ()>::new(IntervalAnalysis)
         .with_iter_limit(10)
         .with_egraph(take(egraph))
         .with_scheduler(SimpleScheduler)
@@ -296,7 +258,8 @@ impl<'a, 'b> SSACtx<'a, 'b> {
             (Some(then_ctx), Some(else_ctx)) => {
                 // Control flow can reach after both branches, so variables need to be merged with
                 // phi nodes.
-                let block = self.add_block(Block::IfElseMerge(then_ctx.last_block, else_ctx.last_block));
+                let block =
+                    self.add_block(Block::IfElseMerge(then_ctx.last_block, else_ctx.last_block));
                 ssa_intersection(&then_ctx.vars, &else_ctx.vars).for_each(
                     |(name, then_value, else_value)| {
                         self.vars
@@ -427,7 +390,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     // relatively simple.
     fn is_always_false(&self, value: Id) -> bool {
         eqsat(&mut self.dfg.borrow_mut(), self.rws);
-        self.mk(SSA::Constant(0)) == self.find(value)
+        self.dfg.borrow()[value].data.is_cons(0)
     }
 }
 
