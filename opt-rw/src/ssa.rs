@@ -238,23 +238,24 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         then_stmt: &'a StmtAST,
         else_stmt: &'a StmtAST,
     ) -> Option<Self> {
-        let true_cond = self.handle_expr(cond);
-        let false_cond = self.mk(SSA::Unary(UnaryOp::Not, true_cond));
-        // Start by assuming that control flow cannot flow after the then or else branches.
+        // Determine the known truthiness of the branch condition and its negation.
+        let then_cond = self.handle_expr(cond);
+        let else_cond = self.mk(SSA::Unary(UnaryOp::Not, then_cond));
+        self.eqsat();
+        let then_always_false = self.is_always_false(then_cond);
+        let else_always_false = self.is_always_false(else_cond);
+
+        // Execute the branch targets, only if they are reachable.
         let mut then_ctx = None;
         let mut else_ctx = None;
-
-        // Before handling the then branch, check if the condition may be true.
-        if !self.is_always_false(true_cond) {
-            let then_block = self.add_block(Block::Child(self.last_block, true_cond));
+        if !then_always_false {
+            let then_block = self.add_block(Block::Child(self.last_block, then_cond));
             let mut ctx = self.clone();
             ctx.last_block = then_block;
             then_ctx = ctx.handle_stmt(then_stmt);
         }
-
-        // Before handling the else branch, check if the condition may be true.
-        if !self.is_always_false(false_cond) {
-            let else_block = self.add_block(Block::Child(self.last_block, false_cond));
+        if !else_always_false {
+            let else_block = self.add_block(Block::Child(self.last_block, else_cond));
             let mut ctx = self.clone();
             ctx.last_block = else_block;
             else_ctx = ctx.handle_stmt(else_stmt);
@@ -268,7 +269,9 @@ impl<'a, 'b> SSACtx<'a, 'b> {
                 // phi nodes.
                 let block =
                     self.add_block(Block::IfElseMerge(then_ctx.last_block, else_ctx.last_block));
-                ssa_intersection(&then_ctx.vars, &else_ctx.vars).for_each(
+                // Perform equality saturation to prevent spurious phis.
+                self.eqsat();
+                ssa_intersection(&then_ctx.vars, &else_ctx.vars, &self.dfg.borrow()).for_each(
                     |(name, then_value, else_value)| {
                         self.vars
                             .insert(name, self.mk(SSA::Phi(block, [then_value, else_value])));
@@ -282,15 +285,16 @@ impl<'a, 'b> SSACtx<'a, 'b> {
     }
 
     fn handle_while(mut self, cond: &ExprAST, stmt: &'a StmtAST) -> Option<Self> {
-        let mut true_cond = self.handle_expr(cond);
+        let mut then_cond = self.handle_expr(cond);
         // If the condition for the while is always false, then just ignore the while.
-        if self.is_always_false(true_cond) {
+        self.eqsat();
+        if self.is_always_false(then_cond) {
             return Some(self);
         }
 
         // Start by assuming that control flow cannot reach after the body of the while. In this
         // case, the while basically acts as an if else.
-        let mut header_block = self.add_block(Block::Child(self.last_block, true_cond));
+        let mut header_block = self.add_block(Block::Child(self.last_block, then_cond));
         let mut after_body_ctx = self.clone();
         after_body_ctx.last_block = header_block;
 
@@ -301,8 +305,10 @@ impl<'a, 'b> SSACtx<'a, 'b> {
 
             loop {
                 let mut fixpoint_reached = true;
+                self.eqsat();
                 let differences: Vec<_> =
-                    ssa_intersection(&self.vars, &after_body_ctx.vars).collect();
+                    ssa_intersection(&self.vars, &after_body_ctx.vars, &self.dfg.borrow())
+                        .collect();
                 differences
                     .iter()
                     .for_each(|(name, init_value, loop_value)| {
@@ -360,7 +366,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
                 header_block = self.add_block(Block::Start);
                 let mut new_ctx = self.clone();
                 new_ctx.last_block = header_block;
-                ssa_intersection(&self.vars, &after_body_ctx.vars).for_each(|(name, _, _)| {
+                differences.iter().for_each(|(name, _, _)| {
                     new_ctx.vars.insert(
                         name,
                         self.mk(SSA::Knot(self.knot(
@@ -370,8 +376,8 @@ impl<'a, 'b> SSACtx<'a, 'b> {
                         ))),
                     );
                 });
-                true_cond = new_ctx.handle_expr(cond);
-                let new_body_block = self.add_block(Block::Child(header_block, true_cond));
+                then_cond = new_ctx.handle_expr(cond);
+                let new_body_block = self.add_block(Block::Child(header_block, then_cond));
                 new_ctx.last_block = new_body_block;
                 after_body_ctx = new_ctx.handle_stmt(stmt).unwrap();
             }
@@ -380,8 +386,9 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         // At this point, self is always a context "at" the branching point for the loop. This is the
         // block preceding the loop if after the body is unreachable or the header of the loop if
         // after the loop is reachable.
-        let false_cond = self.mk(SSA::Unary(UnaryOp::Not, true_cond));
+        let false_cond = self.mk(SSA::Unary(UnaryOp::Not, then_cond));
         // If the while condition is always true, then control flow cannot reach after the while.
+        self.eqsat();
         if self.is_always_false(false_cond) {
             None
         } else {
@@ -432,14 +439,11 @@ impl<'a, 'b> SSACtx<'a, 'b> {
         self.dfg.borrow()[id].data
     }
 
-    // We are lazy about when we actually perform equality saturation. The only time where rewriting
-    // and analysis are important for optimistic SSA translation is when we are determining what
-    // control flow is possible. This always takes the form of determining whether a particular value
-    // is provably always zero. Thus, we just perform equality saturation in each call to
-    // is_always_false. This isn't necessarily the most efficient strategy, but it works and is
-    // relatively simple.
-    fn is_always_false(&self, value: Id) -> bool {
+    fn eqsat(&self) {
         eqsat(&mut self.dfg.borrow_mut(), self.rws);
+    }
+
+    fn is_always_false(&self, value: Id) -> bool {
         self.interval(value).is_cons(0)
     }
 }
@@ -449,12 +453,13 @@ impl<'a, 'b> SSACtx<'a, 'b> {
 fn ssa_intersection<'a, 'b>(
     a: &'a FxHashMap<&'b str, Id>,
     b: &'a FxHashMap<&'b str, Id>,
+    egraph: &'a DFG,
 ) -> impl Iterator<Item = (&'b str, Id, Id)> + 'a {
     a.into_iter().filter_map(|(name, a_value)| {
         if let Some(b_value) = b.get(name)
-            && a_value != b_value
+            && egraph.find(*a_value) != egraph.find(*b_value)
         {
-            Some((*name, *a_value, *b_value))
+            Some((*name, egraph.find(*a_value), egraph.find(*b_value)))
         } else {
             None
         }
