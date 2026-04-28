@@ -53,10 +53,12 @@ where
             // Assuming the cost function is "superior" in Knuth's parlance, starting off by just
             // inserting leaf nodes into the priority queue won't miss out on potentially cheaper
             // extraction candidates.
-            if node.is_leaf() {
+            if node.is_leaf()
+                && let Some(cost) = cf(&node, &costs)
+            {
                 priority.push(QueueElement {
                     node: node.clone(),
-                    cost: cf(&node, &costs).unwrap(),
+                    cost,
                 });
             }
         }
@@ -255,6 +257,20 @@ fn test(x) return ((2 * x) * (2 * x)) * ((2 * x) * (2 * x));
             panic!()
         };
         assert_eq!(costs[&id].0, 96);
+    }
+
+    #[test]
+    fn extract3() {
+        let program = r#"
+fn test(x) { while x { x = x + 1; } return x; }
+"#;
+        let parsed = ProgramParser::new().parse(&program).unwrap();
+        let (dfg, cfg) = optimistic_rewriting(&parsed[0]);
+        let costs = extract(&dfg, placeholder_cost);
+        let Block::Return(_, id) = cfg[5] else {
+            panic!();
+        };
+        assert!(!costs.contains_key(&id));
     }
 
     fn cost_a(node: &SSA, costs: &DualExtraction<SSA>) -> Option<u128> {
