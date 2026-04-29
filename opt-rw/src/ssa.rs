@@ -385,7 +385,7 @@ impl<'a, 'b> SSACtx<'a, 'b> {
 
         // At this point, self is always a context "at" the branching point for the loop. This is the
         // block preceding the loop if after the body is unreachable or the header of the loop if
-        // after the loop is reachable.
+        // after the body is reachable.
         let false_cond = self.mk(SSA::Unary(UnaryOp::Not, then_cond));
         // If the while condition is always true, then control flow cannot reach after the while.
         self.eqsat();
